@@ -4,6 +4,7 @@ A repo has to be traced only once, and the traced repo will be stored in a cache
 """
 
 import os
+os.environ["DISABLE_REMOTE_CACHE"] = "1"
 import re
 import shutil
 import itertools
@@ -24,6 +25,8 @@ from ..utils import working_directory, execute
 
 
 LEAN4_DATA_EXTRACTOR_PATH = Path(__file__).with_name("ExtractData.lean")
+print("======== Lean execuate path =======")
+print(LEAN4_DATA_EXTRACTOR_PATH)
 LEAN4_REPL_PATH = Path(__file__).parent.parent / "interaction" / "Lean4Repl.lean"
 assert LEAN4_DATA_EXTRACTOR_PATH.exists() and LEAN4_REPL_PATH.exists()
 
@@ -107,11 +110,20 @@ def check_files(packages_path: Path, no_deps: bool) -> None:
         for p in cwd.glob("**/build/ir/**/*.dep_paths")
         if not no_deps or not p.is_relative_to(packages_path)
     }
-    oleans = {
+    # 中文说明：Lean 4.10 中项目自身的 `*.olean` 位于 `.lake/build/lib/`，
+    # 而依赖包通常仍在 `build/lib/lean/`。这里两种布局都要统计，否则会把
+    # 主项目生成出来的 `*.ast.json`/`*.dep_paths` 误判成“多出来的文件”。
+    oleans_in_lib_lean = {
         Path(str(p.with_suffix("")).replace("/build/lib/lean/", "/build/ir/"))
         for p in cwd.glob("**/build/lib/lean/**/*.olean")
         if not no_deps or not p.is_relative_to(packages_path)
     }
+    oleans_in_lib = {
+        Path(str(p.with_suffix("")).replace("/build/lib/", "/build/ir/"))
+        for p in cwd.glob("**/build/lib/*.olean")
+        if not no_deps or not p.is_relative_to(packages_path)
+    }
+    oleans = oleans_in_lib_lean | oleans_in_lib
     assert len(jsons) <= len(oleans) and len(deps) <= len(oleans)
     missing_jsons = {p.with_suffix(".ast.json") for p in oleans - jsons}
     missing_deps = {p.with_suffix(".dep_paths") for p in oleans - deps}
@@ -121,13 +133,17 @@ def check_files(packages_path: Path, no_deps: bool) -> None:
 
 
 def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
+    print("\n========== TRACE START ==========", flush=True)
+    print(f"[TRACE] repo = {repo}", flush=True)
     assert (
         repo.exists()
     ), f"The {repo} does not exist. Please check the URL `{repo.commit_url}`."
 
     # Trace `repo` in the current working directory.
     assert not repo.is_lean4, "Cannot trace Lean 4 itself."
+    print("[TRACE] cloning repo...", flush=True)
     repo.clone_and_checkout()
+    print("[TRACE] clone finished", flush=True)
     logger.debug(f"Tracing {repo}")
 
     with working_directory(repo.name):
@@ -137,7 +153,10 @@ def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
                 execute("lake exe cache get")
             except CalledProcessError:
                 pass
-        execute("lake build")
+        print("\n[TRACE] starting lake build...", flush=True)
+        execute("lake build", capture_output=False)
+        execute("lake --version", capture_output=False)
+        print(f"[TRACE] lake build finished ...", flush=True)
 
         # Copy the Lean 4 stdlib into the path of packages.
         lean_prefix = execute(f"lean --print-prefix", capture_output=True)[0].strip()
@@ -158,9 +177,15 @@ def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
             cmd = f"lake env lean --threads {NUM_PROCS} --run ExtractData.lean"
             if not build_deps:
                 cmd += " noDeps"
-            execute(cmd)
-
+            print("\n[TRACE] running ExtractData...", flush=True)
+            print(f"[TRACE] cmd = {cmd}", flush=True)
+            t0 = monotonic()
+            execute(cmd, capture_output=False)
+            print(f"[TRACE] ExtractData finished in {monotonic()-t0:.1f}s", flush=True)
+        
+        print("[TRACE] checking generated AST files...", flush=True)
         check_files(packages_path, not build_deps)
+        print("[TRACE] AST check finished", flush=True)
         os.remove(LEAN4_DATA_EXTRACTOR_PATH.name)
 
         # Copy Lean4Repl.lean into the repo and build it.
@@ -179,7 +204,7 @@ def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
                 oup.write('\n[[lean_lib]]\nname = "Lean4Repl"\n')
 
         try:
-            execute("lake build Lean4Repl")
+            execute("lake build Lean4Repl", capture_output=False)
         except CalledProcessError:
             logger.warning(
                 f"Failed to build Lean4Repl. You may run into issues when interacting with the repo."
@@ -204,17 +229,31 @@ def get_traced_repo_path(repo: LeanGitRepo, build_deps: bool = True) -> Path:
     Returns:
         Path: The path of the traced repo in the cache, e.g. :file:`/home/kaiyu/.cache/lean_dojo/leanprover-community-mathlib-2196ab363eb097c008d4497125e0dde23fb36db2`
     """
+    print("[TRACE] entered get_traced_repo_path()", flush=True)
     rel_cache_dir = repo.get_cache_dirname() / repo.name
+    print(f"[TRACE] rel_cache_dir = {rel_cache_dir}", flush=True)
+
+    print("[TRACE] before cache.get(...)", flush=True)
     path = cache.get(rel_cache_dir)
+    print("[TRACE] after cache.get(...)", flush=True)
+    print("cache.get returned:", path, flush=True)
+
     if path is None:
+        print("[TRACE] cache miss", flush=True)
         logger.info(f"Tracing {repo}")
+        print("[TRACE] before entering working_directory()", flush=True)
         with working_directory() as tmp_dir:
+            print(f"[TRACE] entered working_directory(): {tmp_dir}", flush=True)
             logger.debug(f"Working in the temporary directory {tmp_dir}")
             _trace(repo, build_deps)
             src_dir = tmp_dir / repo.name
+            print(f"[TRACE] src_dir = {src_dir}", flush=True)
             traced_repo = TracedRepo.from_traced_files(src_dir, build_deps)
+            print("[TRACE] after TracedRepo.from_traced_files(...)", flush=True)
             traced_repo.save_to_disk()
+            print("[TRACE] after traced_repo.save_to_disk()", flush=True)
             path = cache.store(src_dir, rel_cache_dir)
+            print(f"[TRACE] after cache.store(...), path = {path}", flush=True)
     else:
         logger.debug("The traced repo is available in the cache.")
     return path
@@ -238,6 +277,10 @@ def trace(
     Returns:
         TracedRepo: A :class:`TracedRepo` object corresponding to the files at ``dst_dir``.
     """
+    print("[TRACE] entered trace()", flush=True)
+    print(f"[TRACE] repo = {repo}", flush=True)
+    print(f"[TRACE] dst_dir = {dst_dir}", flush=True)
+    print(f"[TRACE] build_deps = {build_deps}", flush=True)
     if dst_dir is not None:
         dst_dir = Path(dst_dir)
         assert (

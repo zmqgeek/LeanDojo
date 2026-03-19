@@ -28,6 +28,14 @@ The trace of a tactic.
 structure TacticTrace where
   stateBefore: String
   stateAfter: String
+  -- 中文说明：新增 tactic 执行前目标类型的 Expr 形式字符串，便于保留更底层的表达式结构。
+  goalsBeforeExpr: Array String
+  -- 中文说明：新增 tactic 执行后目标类型的 Expr 形式字符串。
+  goalsAfterExpr: Array String
+  -- 中文说明：新增 tactic 执行前目标类型的结构化 JSON，便于 Python 侧直接解析。
+  goalsBeforeExprJson: Array Json
+  -- 中文说明：新增 tactic 执行后目标类型的结构化 JSON。
+  goalsAfterExprJson: Array Json
   pos: String.Pos      -- Start position of the tactic.
   endPos: String.Pos   -- End position of the tactic.
 deriving ToJson
@@ -61,6 +69,120 @@ abbrev TraceM := StateT Trace MetaM
 
 
 namespace Pp
+
+/-- 自定义表达式结构。 -/
+inductive YourExpr where
+  | bvar (deBruijnIndex : Nat)
+  | fvar (fvarId : String)
+  | mvar (mvarId : String)
+  | sort (u : String)
+  | const (declName : String) (us : List String)
+  | app (fn : YourExpr) (arg : YourExpr)
+  | lam (binderName : String) (binderType : YourExpr) (body : YourExpr) (binderInfo : String)
+  | forallE (binderName : String) (binderType : YourExpr) (body : YourExpr) (binderInfo : String)
+  | letE (declName : String) (type : YourExpr) (value : YourExpr) (body : YourExpr) (nonDep : Bool)
+  | lit (literal : String)
+  | mdata (data : String) (expr : YourExpr)
+  | proj (typeName : String) (idx : Nat) (struct : YourExpr)
+  deriving ToJson, Repr, Inhabited
+
+
+structure Frame where
+  node : Expr
+  childResults : Array YourExpr
+  remaining : List Expr
+  deriving Inhabited
+
+
+private def getChildren (e : Expr) : List Expr :=
+  match e with
+  | Expr.app f a => [f, a]
+  | Expr.lam _ t b _ => [t, b]
+  | Expr.forallE _ t b _ => [t, b]
+  | Expr.letE _ t v b _ => [t, v, b]
+  | Expr.mdata _ e => [e]
+  | Expr.proj _ _ s => [s]
+  | _ => []
+
+
+private def reconstruct (e : Expr) (children : List YourExpr) : YourExpr :=
+  match e with
+  | Expr.bvar idx => YourExpr.bvar idx
+  | Expr.fvar fvarId => YourExpr.fvar (reprStr fvarId)
+  | Expr.mvar mvarId => YourExpr.mvar (reprStr mvarId)
+  | Expr.sort lvl => YourExpr.sort (reprStr lvl)
+  | Expr.const n us => YourExpr.const n.toString (us.map reprStr)
+  | Expr.app _ _ =>
+    match children with
+    | [f', a'] => YourExpr.app f' a'
+    | _ => panic! "Unexpected children count in app"
+  | Expr.lam bn _ _ bi =>
+    match children with
+    | [t', b'] => YourExpr.lam bn.toString t' b' (reprStr bi)
+    | _ => panic! "Unexpected children count in lam"
+  | Expr.forallE bn _ _ bi =>
+    match children with
+    | [t', b'] => YourExpr.forallE bn.toString t' b' (reprStr bi)
+    | _ => panic! "Unexpected children count in forallE"
+  | Expr.letE dn _ _ _ nd =>
+    match children with
+    | [t', v', b'] => YourExpr.letE dn.toString t' v' b' nd
+    | _ => panic! "Unexpected children count in letE"
+  | Expr.lit lit => YourExpr.lit (reprStr lit)
+  | Expr.mdata data _ =>
+    match children with
+    | [e'] => YourExpr.mdata (reprStr data) e'
+    | _ => panic! "Unexpected children count in mdata"
+  | Expr.proj tn idx _ =>
+    match children with
+    | [s'] => YourExpr.proj tn.toString idx s'
+    | _ => panic! "Unexpected children count in proj"
+
+
+/--
+把 `Expr` 转成和 `json_construct.lean` 一致的 `YourExpr` 结构。
+
+中文说明：
+- 这里直接复用 `YourExpr` 的树形结构；
+- 最终 JSON 通过 `toJson yourExpr` 生成，格式与用户给的实现保持一致。
+-/
+private partial def exprToYourExprIter (e : Expr) (maxDepth : Nat := 1000) : MetaM YourExpr := do
+  let mut stack : List Frame := []
+  stack := [{ node := e, childResults := #[], remaining := getChildren e }]
+  while !stack.isEmpty do
+    if stack.length > maxDepth then
+      throwError "Iteration depth exceeded threshold"
+    let top := stack.head!
+    match top.remaining with
+    | child :: rest =>
+      stack := { top with remaining := rest } :: stack.tail!
+      stack := { node := child, childResults := #[], remaining := getChildren child } :: stack
+    | [] =>
+      let result := reconstruct top.node top.childResults.toList
+      stack := stack.tail!
+      if stack.isEmpty then
+        return result
+      else
+        let parent := stack.head!
+        let updatedParent := { parent with childResults := parent.childResults.push result }
+        stack := updatedParent :: stack.tail!
+  unreachable!
+
+
+private def goalExprsCore (goals : List MVarId) : MetaM (Array String × Array Json) := do
+  let mut exprStrs := #[]
+  let mut exprJsons := #[]
+  for goal in goals do
+    match (← getMCtx).findDecl? goal with
+    | none =>
+      exprStrs := exprStrs.push "unknown goal"
+      exprJsons := exprJsons.push <| toJson (YourExpr.lit "unknown goal")
+    | some mvarDecl =>
+      let goalType ← instantiateMVars mvarDecl.type
+      let yourExpr ← exprToYourExprIter goalType 1000
+      exprStrs := exprStrs.push (reprStr goalType)
+      exprJsons := exprJsons.push (toJson yourExpr)
+  return (exprStrs, exprJsons)
 
 
 private def addLine (s : String) : String :=
@@ -133,6 +255,12 @@ def ppGoals (ctx : ContextInfo) (goals : List MVarId) : IO String :=
     return (← fmt).pretty.trim
 
 
+def goalExprs (ctx : ContextInfo) (goals : List MVarId) : IO (Array String × Array Json) := do
+  -- 中文说明：这里显式包一层 `IO`，避免 Lean 4.10 在 `runMetaM` 返回值上出现 universe 推导问题。
+  let result ← ctx.runMetaM {} (goalExprsCore goals)
+  return result
+
+
 end Pp
 
 
@@ -196,6 +324,12 @@ def buildDir : FilePath :=
 
 def libDir : FilePath := buildDir / "lib" / "lean"
 
+/--
+Lean 4.10 中当前项目自身的 `*.olean` 通常位于 `.lake/build/lib/`，
+而不是 `.lake/build/lib/lean/`。单独保留这个目录，方便兼容主项目文件。
+-/
+def rootLibDir : FilePath := buildDir / "lib"
+
 
 /--
 Convert the path of a *.lean file to its corresponding file (e.g., *.olean) in the "build" directory.
@@ -212,7 +346,13 @@ def toBuildDir (subDir : FilePath) (path : FilePath) (ext : String) : Option Fil
       match p.components with
       | [] => none
       | hd :: tl => packagesDir / hd / buildDir / subDir / (mkFilePath tl)
-    | none => buildDir / subDir / path'
+    | none =>
+      -- 中文说明：Lean 4.10 中项目自身的编译产物位于 `.lake/build/lib/`，
+      -- 不是 `.lake/build/lib/lean/`。这里对主项目文件单独分支，避免它们被跳过。
+      if subDir == "lib/lean" then
+        buildDir / "lib" / path'
+      else
+        buildDir / subDir / path'
 
 
 /--
@@ -232,8 +372,11 @@ def toSrcDir! (path : FilePath) (ext : String) : FilePath :=
       let sep := "build/lib/lean/"
       packagesDir / pkgName / (p.toString.splitOn sep |>.tail!.head!)
     | none =>
-      -- E.g., `.lake/build/lib/lean/Mathlib/LinearAlgebra/Basic.olean` -> `Mathlib/LinearAlgebra/Basic.lean`
-      relativeTo path' libDir |>.get!
+      -- 中文说明：Lean 4.10 中项目自身的 `*.olean` 位于 `.lake/build/lib/`；
+      -- 新版项目则常见于 `.lake/build/lib/lean/`。这里同时兼容两种布局。
+      match relativeTo path' libDir with
+      | some p => p
+      | none => relativeTo path' rootLibDir |>.get!
 
 
 /--
@@ -256,9 +399,13 @@ def findLean (mod : Name) : IO FilePath := do
   if modStr == "Lake" then
     return packagesDir / "lean4/src/lean/lake/Lake.lean"
   let olean ← findOLean mod
-  -- Remove a "build/lib/lean/" substring from the path.
+  -- 中文说明：这里继续保留字符串回推源码路径的做法，
+  -- 但补上 Lean 4.10 项目自身使用的 `.lake/build/lib/` 布局。
   let lean := olean.toString.replace ".lake/build/lib/lean/" ""
-    |>.replace "build/lib/lean/" "" |>.replace "lib/lean/Lake/" "lib/lean/lake/Lake/"
+    |>.replace "build/lib/lean/" ""
+    |>.replace ".lake/build/lib/" ""
+    |>.replace "build/lib/" ""
+    |>.replace "lib/lean/Lake/" "lib/lean/lake/Lake/"
   let mut path := FilePath.mk lean |>.withExtension "lean"
   let leanLib ← getLibDir (← getBuildDir)
   if let some p := relativeTo path leanLib then
@@ -298,6 +445,8 @@ private def visitTacticInfo (ctx : ContextInfo) (ti : TacticInfo) (parent : Info
       let ctxAfter := { ctx with mctx := ti.mctxAfter }
       let stateBefore ← Pp.ppGoals ctxBefore ti.goalsBefore
       let stateAfter ← Pp.ppGoals ctxAfter ti.goalsAfter
+      let (goalsBeforeExpr, goalsBeforeExprJson) ← Pp.goalExprs ctxBefore ti.goalsBefore
+      let (goalsAfterExpr, goalsAfterExprJson) ← Pp.goalExprs ctxAfter ti.goalsAfter
       if stateBefore == "no goals" || stateBefore == stateAfter then
         pure ()
       else
@@ -309,6 +458,10 @@ private def visitTacticInfo (ctx : ContextInfo) (ti : TacticInfo) (parent : Info
             trace with tactics := trace.tactics.push {
               stateBefore := stateBefore,
               stateAfter := stateAfter,
+              goalsBeforeExpr := goalsBeforeExpr,
+              goalsAfterExpr := goalsAfterExpr,
+              goalsBeforeExprJson := goalsBeforeExprJson,
+              goalsAfterExprJson := goalsAfterExprJson,
               pos := posBefore,
               endPos := posAfter,
              }
@@ -338,7 +491,9 @@ private def visitTermInfo (ti : TermInfo) (env : Environment) : TraceM Unit := d
   let defEndPos := decRanges >>= fun (decR : DeclarationRanges) => decR.selectionRange.endPos
 
   let modName :=
-  if let some modIdx := env.const2ModIdx.get? fullName then
+  -- 中文说明：Lean 4.10 中 `env.const2ModIdx` 是旧版 `HashMap`，没有 `.get?` 字段；
+  -- 这里改为调用官方提供的 `env.getModuleIdxFor?`，这样对 4.10 和较新的 Lean 都兼容。
+  if let some modIdx := env.getModuleIdxFor? fullName then
     env.header.moduleNames[modIdx.toNat]!
   else
     env.header.mainModule
@@ -408,11 +563,22 @@ end Traversal
 open Traversal
 
 
-def getImports (header: TSyntax `Lean.Parser.Module.header) : IO String := do
+private def headerToImportsCompat (header : Syntax) : Array Import :=
+  -- 中文说明：`Lean.Elab.headerToImports` 在不同 Lean 版本里的参数类型不一致：
+  -- 4.10 接收 `Syntax`，较新版本接收 `TSyntax`。这里直接按语法树结构提取 import，
+  -- 避免因为函数签名变化导致编译失败。
+  let imports := if header[0].isNone then #[{ module := `Init : Import }] else #[]
+  imports ++ header[1].getArgs.map fun stx =>
+    let runtime := !stx[1].isNone
+    let id := stx[2].getId
+    { module := id, runtimeOnly := runtime }
+
+
+def getImports (header : Syntax) : IO String := do
   -- Similar to `lean --deps` in Lean 3.
   let mut s := ""
 
-  for dep in headerToImports header do
+  for dep in headerToImportsCompat header do
     -- let oleanPath ← findOLean dep.module
     let leanPath ← Path.findLean dep.module
     s := s ++ "\n" ++ leanPath.toString
