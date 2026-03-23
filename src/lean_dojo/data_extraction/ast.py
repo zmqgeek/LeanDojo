@@ -323,6 +323,10 @@ class IdentAntiquotNode(Node):
 class LeanElabCommandCommandIrreducibleDefNode(Node):
     name: Optional[str]
     full_name: Optional[str] = None
+    # 中文说明：这里缓存 declaration 的类型表达式字符串，供 `get_premise_definitions()` 导出到 corpus。
+    expr: Optional[str] = None
+    # 中文说明：XML 序列化只适合存字符串，因此这里保存 JSON 字符串，读取时再反序列化。
+    expr_json: Optional[str] = None
 
     @classmethod
     def from_data(
@@ -366,6 +370,9 @@ class MathlibTacticLemmaNode(Node):
     _is_private_decl: Optional[bool] = (
         False  # `_is_private` doesn't play well with lxml.
     )
+    # 中文说明：补充 declaration type 的 pretty string / JSON，避免和 usage premise 混淆。
+    expr: Optional[str] = None
+    expr_json: Optional[str] = None
 
     @classmethod
     def from_data(
@@ -417,6 +424,9 @@ class LemmaNode(Node):
     _is_private_decl: Optional[bool] = (
         False  # `_is_private` doesn't play well with lxml.
     )
+    # 中文说明：补充 declaration type 的 pretty string / JSON，供 premise definition 导出使用。
+    expr: Optional[str] = None
+    expr_json: Optional[str] = None
 
     @classmethod
     def from_data(cls, node_data: Dict[str, Any], lean_file: LeanFile) -> "LemmaNode":
@@ -470,6 +480,9 @@ class LemmaNode(Node):
 class CommandDeclarationNode(Node):
     name: str
     full_name: Optional[str] = None
+    # 中文说明：在 declaration 节点上挂载类型表达式，保持其他节点与现有功能不变。
+    expr: Optional[str] = None
+    expr_json: Optional[str] = None
 
     @classmethod
     def from_data(
@@ -778,6 +791,9 @@ class LeanBinderidentAntiquotNode(Node):
 class StdTacticAliasAliasNode(Node):
     name: str
     full_name: Optional[str] = None
+    # 中文说明：alias 也可能作为 premise definition 导出，因此统一保留类型表达式字段。
+    expr: Optional[str] = None
+    expr_json: Optional[str] = None
 
     @classmethod
     def from_data(
@@ -802,6 +818,9 @@ class StdTacticAliasAliasNode(Node):
 class StdTacticAliasAliaslrNode(Node):
     name: List[str]
     full_name: Optional[List[str]] = None
+    # 中文说明：互递 alias 的类型表达式也走同一套字段，方便后续统一导出。
+    expr: Optional[str] = None
+    expr_json: Optional[str] = None
 
     @classmethod
     def from_data(
@@ -1288,6 +1307,11 @@ class TacticTacticseq1IndentedNode(Node):
 class TacticTacticseqbracketedNode(Node):
     state_before: Optional[str] = None
     state_after: Optional[str] = None
+    # 中文说明：这里把目标 Expr 列表编码成 JSON 字符串保存到 XML，避免复杂字符串数组
+    # 在 XML 属性里按普通 List[str] 反序列化时被逗号等字符破坏。
+    goals_before_expr: Optional[str] = None
+    # 中文说明：结构化 Expr JSON 也统一转成字符串保存，读取时再 `json.loads(...)`。
+    goals_before_expr_json: Optional[str] = None
     tactic: Optional[str] = None
 
     @classmethod
@@ -1549,6 +1573,9 @@ class OtherNode(Node):
     kind: str  # type: ignore
     state_before: Optional[str] = None
     state_after: Optional[str] = None
+    # 中文说明：同上，使用 JSON 字符串跨越 XML 落盘/回读。
+    goals_before_expr: Optional[str] = None
+    goals_before_expr_json: Optional[str] = None
     tactic: Optional[str] = None
 
     @classmethod

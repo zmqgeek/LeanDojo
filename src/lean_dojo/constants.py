@@ -47,7 +47,11 @@ NUM_PROCS = int(os.getenv("NUM_PROCS", min(multiprocessing.cpu_count(), MAX_NUM_
 """Number of processes to use
 """
 
-NUM_WORKERS = NUM_PROCS - 1
+# 中文说明：
+# `NUM_PROCS` 控制 Lean / lake 这一侧的并行度；
+# `NUM_WORKERS` 控制 Python/Ray 解析 `*.ast.json`、读写 XML 的并行度。
+# 两者拆开后，才能在“编译还想并行、但 Python 后处理想省内存”时分别调参。
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", max(1, NUM_PROCS - 1)))
 
 LEAN4_URL = "https://github.com/leanprover/lean4"
 """The URL of the Lean 4 repo."""

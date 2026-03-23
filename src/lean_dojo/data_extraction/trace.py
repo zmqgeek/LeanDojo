@@ -20,7 +20,7 @@ from typing import Union, Optional, List, Generator
 from .cache import cache
 from .lean import LeanGitRepo
 from ..constants import NUM_PROCS
-from .traced_data import TracedRepo
+from .traced_data import TracedRepo, save_xml_from_traced_files
 from ..utils import working_directory, execute
 
 
@@ -248,10 +248,12 @@ def get_traced_repo_path(repo: LeanGitRepo, build_deps: bool = True) -> Path:
             _trace(repo, build_deps)
             src_dir = tmp_dir / repo.name
             print(f"[TRACE] src_dir = {src_dir}", flush=True)
-            traced_repo = TracedRepo.from_traced_files(src_dir, build_deps)
-            print("[TRACE] after TracedRepo.from_traced_files(...)", flush=True)
-            traced_repo.save_to_disk()
-            print("[TRACE] after traced_repo.save_to_disk()", flush=True)
+            # 中文说明：
+            # 这里不再先把整个仓库的所有 `*.ast.json` 一次性解析成一个巨大的
+            # `TracedRepo` 对象再统一落盘，而是改成逐文件解析、逐文件写 XML。
+            # 这样大仓库（尤其 mathlib4）在 Python 后处理阶段的内存不会持续累积。
+            save_xml_from_traced_files(src_dir, build_deps)
+            print("[TRACE] after save_xml_from_traced_files(...)", flush=True)
             path = cache.store(src_dir, rel_cache_dir)
             print(f"[TRACE] after cache.store(...), path = {path}", flush=True)
     else:

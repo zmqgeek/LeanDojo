@@ -56,12 +56,25 @@ deriving ToJson
 
 
 /--
+The trace of a declaration definition.
+-/
+structure DeclarationTrace where
+  fullName: String             -- Fully-qualified name of the declaration.
+  defPos: Option Position      -- Where the declaration is defined.
+  defEndPos: Option Position
+  expr: String                 -- Pretty string of the declaration type.
+  exprJson: Json               -- Structured JSON of the declaration type Expr.
+deriving ToJson
+
+
+/--
 The trace of a Lean file.
 -/
 structure Trace where
   commandASTs : Array Syntax    -- The ASTs of the commands in the file.
   tactics: Array TacticTrace    -- All tactics in the file.
   premises: Array PremiseTrace  -- All premises in the file.
+  declarations: Array DeclarationTrace  -- All declaration type expressions in the file.
 deriving ToJson
 
 
@@ -259,6 +272,25 @@ def goalExprs (ctx : ContextInfo) (goals : List MVarId) : IO (Array String × Ar
   -- 中文说明：这里显式包一层 `IO`，避免 Lean 4.10 在 `runMetaM` 返回值上出现 universe 推导问题。
   let result ← ctx.runMetaM {} (goalExprsCore goals)
   return result
+
+
+def ppExpr (env : Environment) (expr : Expr) : IO String := do
+  -- 中文说明：declaration type 需要 pretty string，这里复用 Lean 的 `Meta.ppExpr`，
+  -- 与 tactic state 中的展示风格保持一致。
+  let (fmt, _) ← (do
+    let expr ← instantiateMVars expr
+    Meta.ppExpr expr
+  ).run'.toIO { fileName := "<declaration>", fileMap := FileMap.ofString "" } { env := env }
+  return fmt.pretty
+
+
+def exprToJson (env : Environment) (expr : Expr) : IO Json := do
+  -- 中文说明：结构化 `expr_json` 继续复用上面的 `YourExpr` 编码，保持和现有 Expr JSON 风格一致。
+  let (yourExpr, _) ← (do
+    let expr ← instantiateMVars expr
+    exprToYourExprIter expr
+  ).run'.toIO { fileName := "<declaration>", fileMap := FileMap.ofString "" } { env := env }
+  return toJson yourExpr
 
 
 end Pp
@@ -563,6 +595,40 @@ end Traversal
 open Traversal
 
 
+private def collectDeclarations (env : Environment) : IO (Array DeclarationTrace) := do
+  let mainModule := env.header.mainModule
+  let mut declarations := #[]
+
+  -- 中文说明：这里遍历当前模块里的常量声明，直接从 declaration 的 `type` 提取
+  -- `expr` / `expr_json`，确保数据来源不是 usage premise。
+  for (declName, constInfo) in env.constants.toList do
+    let modName :=
+      if let some modIdx := env.getModuleIdxFor? declName then
+        env.header.moduleNames[modIdx.toNat]!
+      else
+        env.header.mainModule
+    if modName != mainModule then
+      continue
+
+    let (decRanges, _) ← ((findDeclarationRanges? declName : CoreM (Option DeclarationRanges))).toIO
+      { fileName := "<declaration>", fileMap := FileMap.ofString "" }
+      { env := env }
+    let defPos := decRanges >>= fun (decR : DeclarationRanges) => decR.selectionRange.pos
+    let defEndPos := decRanges >>= fun (decR : DeclarationRanges) => decR.selectionRange.endPos
+    let expr ← Pp.ppExpr env constInfo.type
+    let exprJson ← Pp.exprToJson env constInfo.type
+
+    declarations := declarations.push {
+      fullName := toString declName
+      defPos := defPos
+      defEndPos := defEndPos
+      expr := expr
+      exprJson := exprJson
+    }
+
+  return declarations
+
+
 private def headerToImportsCompat (header : Syntax) : Array Import :=
   -- 中文说明：`Lean.Elab.headerToImports` 在不同 Lean 版本里的参数类型不一致：
   -- 4.10 接收 `Syntax`，较新版本接收 `TSyntax`。这里直接按语法树结构提取 import，
@@ -629,7 +695,8 @@ unsafe def processFile (path : FilePath) : IO Unit := do
   let commands := s.commands.pop -- Remove EOI command.
   let trees := s.commandState.infoState.trees.toArray
 
-  let traceM := (traverseForest trees env').run' ⟨#[header] ++ commands, #[], #[]⟩
+  let declarations ← collectDeclarations env'
+  let traceM := (traverseForest trees env').run' ⟨#[header] ++ commands, #[], #[], declarations⟩
   let (trace, _) ← traceM.run'.toIO {fileName := s!"{path}", fileMap := FileMap.ofString input} {env := env}
 
   let cwd ← IO.currentDir

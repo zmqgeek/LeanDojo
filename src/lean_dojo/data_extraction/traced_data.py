@@ -1,5 +1,6 @@
 """This module defines traced repos/files/theorems."""
 
+import gc
 import re
 import os
 import ray
@@ -174,6 +175,18 @@ class TracedTactic:
         """Pretty-printed state after applying the tactic."""
         assert self.ast.state_after is not None
         return self.ast.state_after
+
+    @property
+    def goals_before_expr(self) -> List[str]:
+        """Goal-type expressions before applying the tactic."""
+        assert getattr(self.ast, "goals_before_expr", None) is not None
+        return json.loads(self.ast.goals_before_expr)
+
+    @property
+    def goals_before_expr_json(self) -> List[Any]:
+        """Structured goal-type expressions before applying the tactic."""
+        assert getattr(self.ast, "goals_before_expr_json", None) is not None
+        return json.loads(self.ast.goals_before_expr_json)
 
     @property
     def start(self) -> Pos:
@@ -559,6 +572,7 @@ class TracedFile:
             lean_file,
             data["tactics"],
             data["premises"],
+            data.get("declarations", []),
             data["module_paths"],
             comments,
         )
@@ -572,6 +586,7 @@ class TracedFile:
         lean_file: LeanFile,
         tactics_data: List[Dict[str, Any]],
         premises_data: List[Dict[str, Any]],
+        declarations_data: List[Dict[str, Any]],
         imports_data: List[str],
         comments: List[Comment],
     ) -> None:
@@ -596,6 +611,14 @@ class TracedFile:
             start = Pos(line_nb=start_line_nb, column_nb=start_column_nb + 1)
             end = Pos(line_nb=end_line_nb, column_nb=end_column_nb + 1)
             pos2premises[(start, end)] = p
+
+        # 中文说明：这里把 Lean 侧导出的 declaration type 信息按 full name 建索引，
+        # 后面回填到 declaration 节点上，供 `get_premise_definitions()` 与 corpus 导出复用。
+        full_name2declarations = {
+            d["fullName"]: d
+            for d in declarations_data
+            if d is not None and d.get("fullName") is not None
+        }
 
         inside_sections_namespaces = []
 
@@ -630,6 +653,21 @@ class TracedFile:
                     else _qualify_name(node.name, prefix)
                 )
                 object.__setattr__(node, "full_name", full_name)
+                # 中文说明：`expr` / `expr_json` 必须来自 declaration 的 type expression，
+                # 因此这里只从 Lean 侧的 declaration trace 回填，不使用 usage premise。
+                declaration = (
+                    full_name2declarations.get(full_name)
+                    if isinstance(full_name, str)
+                    else None
+                )
+                if declaration is not None:
+                    object.__setattr__(node, "expr", declaration.get("expr"))
+                    expr_json = declaration.get("exprJson")
+                    object.__setattr__(
+                        node,
+                        "expr_json",
+                        None if expr_json is None else json.dumps(expr_json),
+                    )
                 if isinstance(node, CommandDeclarationNode) and node.is_theorem:
                     object.__setattr__(node.get_theorem_node(), "full_name", full_name)
             elif isinstance(
@@ -652,6 +690,19 @@ class TracedFile:
                     tac = _fix_indentation(tac, tac_node.start.column_nb - 1)
                     object.__setattr__(tac_node, "state_before", t["stateBefore"])
                     object.__setattr__(tac_node, "state_after", t["stateAfter"])
+                    # 中文说明：这些字段已经在 `ExtractData.lean` 的 `tactics` 里生成了，
+                    # 这里把它们回填到 tactic AST 节点上，并序列化成字符串，便于后续
+                    # 通过 `*.trace.xml` 持久化，再在导出数据集时恢复成 Python 对象。
+                    object.__setattr__(
+                        tac_node,
+                        "goals_before_expr",
+                        json.dumps(t.get("goalsBeforeExpr")),
+                    )
+                    object.__setattr__(
+                        tac_node,
+                        "goals_before_expr_json",
+                        json.dumps(t.get("goalsBeforeExprJson")),
+                    )
                     object.__setattr__(tac_node, "tactic", tac)
             elif isinstance(node, IdentNode):
                 start, end = node.get_closure()
@@ -873,6 +924,14 @@ class TracedFile:
                             {
                                 "full_name": s,
                                 "code": code,
+                                # 中文说明：新字段来自 declaration node 上缓存的类型表达式，
+                                # 最终会被 corpus 构建脚本原样写入 `corpus.jsonl`。
+                                "expr": getattr(node, "expr", None),
+                                "expr_json": (
+                                    json.loads(node.expr_json)
+                                    if getattr(node, "expr_json", None) is not None
+                                    else None
+                                ),
                                 "start": list(start),
                                 "end": list(end),
                                 "kind": node.kind(),
@@ -883,6 +942,12 @@ class TracedFile:
                         {
                             "full_name": node.full_name,
                             "code": code,
+                            "expr": getattr(node, "expr", None),
+                            "expr_json": (
+                                json.loads(node.expr_json)
+                                if getattr(node, "expr_json", None) is not None
+                                else None
+                            ),
                             "start": list(start),
                             "end": list(end),
                             "kind": node.kind(),
@@ -944,6 +1009,42 @@ def _save_xml_to_disk(tf: TracedFile) -> None:
     xml_path = tf.root_dir / to_xml_path(tf.root_dir, tf.path, tf.repo)
     with xml_path.open("wt") as oup:
         oup.write(tf.to_xml())
+
+
+def save_xml_from_traced_files(
+    root_dir: Union[str, Path], build_deps: bool = True
+) -> None:
+    """Parse ``*.ast.json`` files and stream ``*.trace.xml`` files to disk.
+
+    This avoids materializing the entire traced repo in memory at once, which is
+    especially important for large repos such as mathlib4.
+    """
+    root_dir = Path(root_dir).resolve()
+    if not is_git_repo(root_dir):
+        raise RuntimeError(f"{root_dir} is not a Git repo.")
+    repo = LeanGitRepo.from_path(root_dir)
+
+    # 中文说明：
+    # 这里仍然会遍历所有 `*.ast.json`，但每次只保留当前文件对应的 `TracedFile`
+    # 对象，写完 XML 后立刻释放，避免把整个仓库的 AST 全挂在内存里。
+    json_paths = list(root_dir.glob("**/*.ast.json"))
+    if not build_deps:
+        json_paths = [
+            p
+            for p in json_paths
+            if not p.is_relative_to(root_dir / LEAN4_PACKAGES_DIR)
+        ]
+
+    logger.debug(
+        f"Streaming {len(json_paths)} *.ast.json files to XML in {root_dir} sequentially"
+    )
+    for idx, path in enumerate(tqdm(json_paths), start=1):
+        tf = TracedFile.from_traced_file(root_dir, path, repo)
+        _save_xml_to_disk(tf)
+        del tf
+        # 中文说明：周期性显式触发 GC，帮助更快回收上一批大对象。
+        if idx % 8 == 0:
+            gc.collect()
 
 
 def _build_dependency_graph(
