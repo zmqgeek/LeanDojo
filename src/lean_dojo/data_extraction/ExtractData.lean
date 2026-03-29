@@ -22,6 +22,45 @@ deriving instance ToJson for Position
 namespace LeanDojo
 
 
+private def tmpPath (path : FilePath) : FilePath :=
+  System.FilePath.mk s!"{path}.tmp"
+
+
+private def cleanupTmpFile (path : FilePath) : IO Unit := do
+  try
+    IO.FS.removeFile path
+  catch _ =>
+    pure ()
+
+
+private def writeFileAtomically (path : FilePath) (content : String) : IO Unit := do
+  let tmp := tmpPath path
+  Path.makeParentDirs path
+  cleanupTmpFile tmp
+  IO.FS.writeFile tmp content
+  IO.FS.rename tmp path
+
+
+private def isCompletedAstFile (path : FilePath) : IO Bool := do
+  if !(← path.pathExists) then
+    return false
+  try
+    let contents ← IO.FS.readFile path
+    return Json.parse contents |>.isOk
+  catch _ =>
+    return false
+
+
+private def isCompletedDepFile (path : FilePath) : IO Bool := do
+  return ← path.pathExists
+
+
+private def outputsComplete (relativePath : FilePath) : IO Bool := do
+  let jsonPath := Path.toBuildDir "ir" relativePath "ast.json" |>.get!
+  let depPath := Path.toBuildDir "ir" relativePath "dep_paths" |>.get!
+  return (← isCompletedAstFile jsonPath) && (← isCompletedDepFile depPath)
+
+
 /--
 The trace of a tactic.
 -/
@@ -30,12 +69,8 @@ structure TacticTrace where
   stateAfter: String
   -- 中文说明：新增 tactic 执行前目标类型的 Expr 形式字符串，便于保留更底层的表达式结构。
   goalsBeforeExpr: Array String
-  -- 中文说明：新增 tactic 执行后目标类型的 Expr 形式字符串。
-  goalsAfterExpr: Array String
   -- 中文说明：新增 tactic 执行前目标类型的结构化 JSON，便于 Python 侧直接解析。
   goalsBeforeExprJson: Array Json
-  -- 中文说明：新增 tactic 执行后目标类型的结构化 JSON。
-  goalsAfterExprJson: Array Json
   pos: String.Pos      -- Start position of the tactic.
   endPos: String.Pos   -- End position of the tactic.
 deriving ToJson
@@ -478,7 +513,6 @@ private def visitTacticInfo (ctx : ContextInfo) (ti : TacticInfo) (parent : Info
       let stateBefore ← Pp.ppGoals ctxBefore ti.goalsBefore
       let stateAfter ← Pp.ppGoals ctxAfter ti.goalsAfter
       let (goalsBeforeExpr, goalsBeforeExprJson) ← Pp.goalExprs ctxBefore ti.goalsBefore
-      let (goalsAfterExpr, goalsAfterExprJson) ← Pp.goalExprs ctxAfter ti.goalsAfter
       if stateBefore == "no goals" || stateBefore == stateAfter then
         pure ()
       else
@@ -491,9 +525,7 @@ private def visitTacticInfo (ctx : ContextInfo) (ti : TacticInfo) (parent : Info
               stateBefore := stateBefore,
               stateAfter := stateAfter,
               goalsBeforeExpr := goalsBeforeExpr,
-              goalsAfterExpr := goalsAfterExpr,
               goalsBeforeExprJson := goalsBeforeExprJson,
-              goalsAfterExprJson := goalsAfterExprJson,
               pos := posBefore,
               endPos := posAfter,
              }
@@ -704,12 +736,10 @@ unsafe def processFile (path : FilePath) : IO Unit := do
 
   let some relativePath := Path.relativeTo path cwd | throw $ IO.userError s!"Invalid path: {path}"
   let json_path := Path.toBuildDir "ir" relativePath "ast.json" |>.get!
-  Path.makeParentDirs json_path
-  IO.FS.writeFile json_path (toJson trace).pretty
+  writeFileAtomically json_path (toJson trace).pretty
 
   let dep_path := Path.toBuildDir "ir" relativePath "dep_paths" |>.get!
-  Path.makeParentDirs dep_path
-  IO.FS.writeFile dep_path (← getImports header)
+  writeFileAtomically dep_path (← getImports header)
 
 
 end LeanDojo
@@ -733,36 +763,91 @@ def shouldProcess (path : FilePath) (noDeps : Bool) : IO Bool := do
 
   let some oleanPath := Path.toBuildDir "lib/lean" relativePath "olean" |
     throw $ IO.userError s!"Invalid path: {path}"
-  return ← oleanPath.pathExists
+  if !(← oleanPath.pathExists) then
+    return false
+
+  return !(← outputsComplete relativePath)
+
+
+def processFileIfNeeded (path : FilePath) (noDeps : Bool := false) : IO Bool := do
+  if ← shouldProcess path noDeps then
+    processFile path
+    return true
+  return false
 
 
 /--
 Trace all *.lean files in the current directory whose corresponding *.olean file exists.
 -/
-def processAllFiles (noDeps : Bool) : IO Unit := do
+unsafe def processAllFiles (noDeps : Bool) : IO Unit := do
     let cwd ← IO.currentDir
     assert! cwd.fileName != "lean4"
     println! "Extracting data at {cwd}"
 
-    let mut tasks := #[]
+    let fileWorkers :=
+      match (← IO.getEnv "NUM_FILE_WORKERS") with
+      | some s =>
+        match s.trim.toNat? with
+        | some n => max n 1
+        | none => 1
+      | none => 1
+    println! s!"Using up to {fileWorkers} file workers"
+
+    let mut batch : Array (Task (Except IO.Error String) × FilePath) := #[]
+    let flushBatch := fun
+      (batchIdx : Nat)
+      (tasks : Array (Task (Except IO.Error String) × FilePath)) => do
+      let batchIdx := batchIdx + 1
+      println! s!"[BATCH {batchIdx}] start size={tasks.size}"
+      for (_, path) in tasks do
+        println! s!"[BATCH {batchIdx}] queued {path}"
+      for (t, path) in tasks do
+        println! s!"[BATCH {batchIdx}] waiting {path}"
+        match ← IO.wait t with
+        | Except.error _ =>
+          println! s!"[BATCH {batchIdx}] failed {path}"
+          println! s!"WARNING: Failed to process {path}"
+          pure ()
+        | Except.ok _ =>
+          println! s!"[BATCH {batchIdx}] done {path}"
+          pure ()
+      println! s!"[BATCH {batchIdx}] end size={tasks.size}"
+      return batchIdx
+
+    let mut batchIdx : Nat := 0
+
     for path in ← System.FilePath.walkDir cwd do
       if ← shouldProcess path noDeps then
-        let t ← IO.asTask $ IO.Process.run
-          {cmd := "lake", args := #["env", "lean", "--run", "ExtractData.lean", path.toString]}
-        tasks := tasks.push (t, path)
+        if fileWorkers <= 1 then
+          println! s!"[FILE] start {path}"
+          try
+            let processed ← processFileIfNeeded path noDeps
+            if processed then
+              println! s!"[FILE] done {path}"
+            else
+              println! s!"[FILE] skip {path}"
+          catch _ =>
+            println! s!"[FILE] failed {path}"
+            println! s!"WARNING: Failed to process {path}"
+            pure ()
+        else
+          println! s!"[SCHEDULE] batch_slot={batch.size + 1}/{fileWorkers} path={path}"
+          let t ← IO.asTask <| IO.Process.run
+            {cmd := "lake", args := #["env", "lean", "--run", "ExtractData.lean", path.toString]}
+          batch := batch.push (t, path)
+          if batch.size >= fileWorkers then
+            batchIdx ← flushBatch batchIdx batch
+            batch := #[]
 
-    for (t, path) in tasks do
-      match ← IO.wait t with
-      | Except.error _ =>
-        println! s!"WARNING: Failed to process {path}"
-        pure ()
-        -- throw e
-      | Except.ok _ => pure ()
+    if batch.size > 0 then
+      batchIdx ← flushBatch batchIdx batch
 
 
 unsafe def main (args : List String) : IO Unit := do
   match args with
   | ["noDeps"] => processAllFiles (noDeps := true)
-  | [path] => processFile (← Path.toAbsolute ⟨path⟩)
+  | [path] =>
+    let absPath ← Path.toAbsolute ⟨path⟩
+    discard <| processFileIfNeeded absPath
   | [] => processAllFiles (noDeps := false)
   | _ => throw $ IO.userError "Invalid arguments"

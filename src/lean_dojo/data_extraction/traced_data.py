@@ -1007,8 +1007,28 @@ class TracedFile:
 
 def _save_xml_to_disk(tf: TracedFile) -> None:
     xml_path = tf.root_dir / to_xml_path(tf.root_dir, tf.path, tf.repo)
-    with xml_path.open("wt") as oup:
+    xml_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = xml_path.with_name(xml_path.name + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    with tmp_path.open("wt") as oup:
         oup.write(tf.to_xml())
+    tmp_path.replace(xml_path)
+
+
+def _is_complete_xml_output(root_dir: Path, json_path: Path, repo: LeanGitRepo) -> bool:
+    lean_path = to_lean_path(root_dir, json_path)
+    xml_path = root_dir / to_xml_path(root_dir, lean_path, repo)
+    if not xml_path.exists():
+        return False
+
+    try:
+        if xml_path.stat().st_mtime < json_path.stat().st_mtime:
+            return False
+        TracedFile.from_xml(root_dir, xml_path, repo)
+        return True
+    except Exception:
+        return False
 
 
 def save_xml_from_traced_files(
@@ -1039,6 +1059,8 @@ def save_xml_from_traced_files(
         f"Streaming {len(json_paths)} *.ast.json files to XML in {root_dir} sequentially"
     )
     for idx, path in enumerate(tqdm(json_paths), start=1):
+        if _is_complete_xml_output(root_dir, path, repo):
+            continue
         tf = TracedFile.from_traced_file(root_dir, path, repo)
         _save_xml_to_disk(tf)
         del tf
